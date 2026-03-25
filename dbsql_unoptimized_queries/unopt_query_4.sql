@@ -6,17 +6,23 @@
 --
 -- Anti-patterns demonstrated:
 --   1. PARTITION BY on provider_name (high-cardinality free-text, 800K uniques)
---      creates 800K tiny shuffle partitions with massive overhead
---   2. No Z-ORDER on providers table for specialty-based filtering
+--      creates 800K tiny shuffle partitions — even with serverless AQE
+--      coalescing, this creates massive scheduling overhead
+--   2. No liquid clustering on providers table for specialty-based filtering —
+--      Predictive I/O has no cluster metadata to skip files
 --   3. Full scan of entire claims history (no date filter)
 --   4. RANK() window also partitioned by provider_name instead of specialty
---   5. Mixing aggregation with window functions in a single query
+--   5. Mixing aggregation with window functions forces Photon to materialize
+--      intermediate results unnecessarily
 --
--- Query Profile indicators to look for:
+-- DBSQL Serverless Query Profile indicators to look for:
 --   - Window node: PARTITION BY provider_name = 800K shuffle partitions
---   - Sort stage: entire claims history sorted globally
---   - FileScan on providers: no file pruning (missing Z-ORDER on specialty)
+--   - Sort stage: entire claims history sorted globally (Photon accelerates
+--     sort but volume is the problem)
+--   - FileScan on providers: no file/cluster pruning on specialty
 --   - Exchange node: high shuffle bytes but tiny per-partition computation
+--   - Serverless auto-scale may spin up extra compute but the bottleneck
+--     is the sort/shuffle, not compute capacity
 -- =============================================================================
 
 SELECT

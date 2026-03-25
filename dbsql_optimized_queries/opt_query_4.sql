@@ -1,41 +1,62 @@
 -- =============================================================================
--- OPTIMIZED QUERY 4: Provider Readmission Rate Ranking (Stars/Quality)
+-- OPTIMIZED QUERY 4: Provider Readmission Rate Ranking (Serverless)
 -- =============================================================================
 -- Business Question: Rank providers by readmission rate within specialty
 --                    for Stars/quality reporting.
 --
--- Optimizations applied:
---   1. TABLE MAINTENANCE: Z-ORDER providers on (specialty, state) for
---      file pruning + ANALYZE TABLE for optimizer statistics
---   2. PARTITION BY provider_id: Uses low-cardinality ID instead of
---      high-cardinality free-text provider_name (800K → efficient partitions)
---   3. PRE-AGGREGATE BEFORE WINDOW: CTE computes admit stats per provider,
---      then applies RANK() on the smaller aggregated result
---   4. BROADCAST HINT: providers table (800K) broadcast to avoid shuffle
---   5. DATE FILTER: Restricts to 2023 for partition pruning
---   6. RANK BY SPECIALTY: Window function ranks within specialty, not
---      globally by provider_name
+-- Serverless-native optimizations applied:
 --
--- Expected improvements:
---   - Eliminates 800K Exchange partitions from provider_name windowing
---   - Z-ORDER enables file pruning on specialty-based queries
---   - Pre-aggregation reduces data flowing into the window function
+--   1. LIQUID CLUSTERING (replaces Z-ORDER): Cluster providers on (specialty,
+--      state) instead of legacy OPTIMIZE ... ZORDER BY. Liquid clustering is
+--      incremental — new data is automatically clustered on write without
+--      full table rewrites. Predictive I/O uses the cluster metadata to
+--      skip files not matching specialty filters.
+--
+--   2. PARTITION BY provider_id (not provider_name): Uses low-cardinality ID
+--      instead of high-cardinality free-text. Even with serverless AQE
+--      auto-coalescing tiny partitions, 800K unique provider_name values
+--      create massive scheduling overhead that cannot be fully optimized away.
+--
+--   3. PRE-AGGREGATE BEFORE WINDOW: CTE computes admit stats per provider_id
+--      first (~80K distinct providers with IP claims), then applies RANK()
+--      on the much smaller aggregated result. Photon's vectorized window
+--      function runs on 80K rows instead of millions.
+--
+--   4. BROADCAST HINT: providers (800K rows) is broadcast. With fresh stats
+--      from ANALYZE TABLE, serverless CBO may auto-broadcast, but the hint
+--      guarantees it.
+--
+--   5. ANALYZE TABLE (replaces COMPUTE STATISTICS): Feeds the serverless CBO
+--      with fresh column-level statistics including histograms. This enables
+--      optimal join ordering and accurate cardinality estimates.
+--
+--   6. DATE FILTER + LIQUID CLUSTERING: service_date filter on claims leverages
+--      the liquid clustering set up in Q1 for efficient pruning.
+--
+-- Expected serverless improvements:
+--   - Liquid clustering enables Predictive I/O file skipping on specialty
+--   - Pre-aggregation: window function processes 80K rows, not 50M
+--   - Photon vectorized window/sort on the small aggregated dataset
+--   - AQE auto-sizes shuffle partitions for the provider_id window
 -- =============================================================================
 
--- Step 1: Run once — Z-ORDER providers on specialty (most common filter/join column)
-OPTIMIZE serverless_stable_swv01_catalog.dbsql_opt.providers ZORDER BY (specialty, state);
+-- Step 1 (run once): Liquid clustering on providers — replaces legacy Z-ORDER
+-- Unlike Z-ORDER which requires periodic manual OPTIMIZE runs, liquid clustering
+-- automatically reorganizes data on new writes. Incremental, not full-rewrite.
+ALTER TABLE serverless_stable_swv01_catalog.dbsql_opt.providers
+  CLUSTER BY (specialty, state);
 
--- Step 2: Compute statistics for cost-based optimizer decisions
+OPTIMIZE serverless_stable_swv01_catalog.dbsql_opt.providers;
 ANALYZE TABLE serverless_stable_swv01_catalog.dbsql_opt.providers COMPUTE STATISTICS FOR ALL COLUMNS;
 
--- Step 3: Optimized readmission ranking query
+-- Step 2: Optimized readmission ranking query
 WITH admit_base AS (
   SELECT
     c.provider_id,
     c.service_date,
     c.claim_type,
     ROW_NUMBER() OVER (
-      PARTITION BY c.provider_id
+      PARTITION BY c.provider_id    -- low-cardinality ID, not free-text name
       ORDER BY c.service_date
     ) AS visit_seq,
     LAG(c.service_date) OVER (
@@ -62,8 +83,17 @@ SELECT
   ps.total_admits,
   ps.readmissions,
   ROUND(ps.readmissions / ps.total_admits * 100, 2)             AS readmit_rate_pct,
-  RANK() OVER (PARTITION BY p.specialty
+  RANK() OVER (PARTITION BY p.specialty                         -- rank within specialty
                ORDER BY ps.readmissions / ps.total_admits DESC) AS specialty_rank
 FROM provider_stats ps
 JOIN /*+ BROADCAST(p) */ serverless_stable_swv01_catalog.dbsql_opt.providers p
   ON ps.provider_id = p.provider_id;
+
+-- NOTE on serverless behavior:
+-- - Liquid clustering vs Z-ORDER: LC is incremental and write-time optimized;
+--   Z-ORDER requires periodic full-table OPTIMIZE runs. LC is the serverless way.
+-- - AQE auto-sizes shuffle partitions for the provider_id window function
+-- - Photon vectorized sort for the LAG/ROW_NUMBER windows
+-- - Predictive I/O learns that specialty + state are commonly filtered columns
+-- - Compare Query Profile: look for "cluster pruning" in the FileScan node
+--   details on the providers table (not present in unoptimized version)

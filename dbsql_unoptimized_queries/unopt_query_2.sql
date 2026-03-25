@@ -6,16 +6,23 @@
 -- Anti-patterns demonstrated:
 --   1. Skewed join on high-frequency ICD codes (E11=diabetes, I10=hypertension
 --      dominate millions of rows causing massive data skew)
---   2. No skew handling — few tasks will run 10+ minutes while others finish
---      in seconds
---   3. icd10_lookup (75K rows) is shuffle-joined instead of broadcast
---   4. No date filter on claims — scans entire 50M row history
+--   2. No skew handling — even with serverless AQE auto-skew detection,
+--      extreme skew (30% of 150M rows on 2 codes) can exceed automatic
+--      thresholds and still produce long-tail tasks
+--   3. icd10_lookup (75K rows) is shuffle-joined — serverless may auto-broadcast
+--      this but stale stats can prevent it
+--   4. No date filter on claims — scans entire 50M row history, bypassing
+--      Predictive I/O data skipping on the service_date cluster key
+--   5. No ANALYZE TABLE — serverless CBO relies on fresh statistics to make
+--      optimal join strategy decisions
 --
--- Query Profile indicators to look for:
---   - Stage timeline: ~198 tasks finish quickly, 2 tasks run 10+ minutes
---   - SortMergeJoin task metrics: max shuffle read >> median (e.g., 50MB vs 4GB)
+-- DBSQL Serverless Query Profile indicators to look for:
+--   - Stage timeline: most tasks finish quickly, 2-3 tasks run much longer
+--     (AQE may partially mitigate but extreme skew still shows)
+--   - SortMergeJoin task metrics: max shuffle read >> median
 --   - Exchange node: enormous shuffle bytes from skewed ICD codes
---   - icd10_lookup being shuffle-joined (should be broadcast at 75K rows)
+--   - Scan node: no cluster pruning applied (missing date filter)
+--   - Photon executes fast per-row but is bottlenecked by I/O volume
 -- =============================================================================
 
 SELECT

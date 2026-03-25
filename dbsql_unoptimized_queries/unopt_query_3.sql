@@ -5,17 +5,23 @@
 --                    plan's average inpatient cost for utilization management.
 --
 -- Anti-patterns demonstrated:
---   1. Correlated subquery re-executes per outer row (catastrophic at scale)
---   2. Inner subquery re-materializes claims table multiple times
---   3. No shuffle partition tuning — default 200 partitions for 50M rows
---      causes massive spill to disk
---   4. No date filter — scans full claims history
+--   1. Correlated subquery re-executes per outer row — even Photon's vectorized
+--      execution cannot optimize away the repeated scans
+--   2. Inner subquery re-materializes claims table multiple times — serverless
+--      AQE cannot reuse intermediate results across correlated iterations
+--   3. No date filter — full claims history scanned, bypassing Predictive I/O
+--      and any liquid clustering pruning on service_date
+--   4. Serverless auto-scales compute but the correlated pattern serializes
+--      the work, negating the elasticity benefit
 --
--- Query Profile indicators to look for:
+-- DBSQL Serverless Query Profile indicators to look for:
 --   - Repeated Exchange/Sort nodes: subquery re-materializes identical scans
---   - Spill metrics: high "Disk Bytes Spilled" on shuffle stages
---   - Wall clock time dominated by inner aggregation running per outer row
---   - spark.sql.shuffle.partitions=200 vs actual data volume mismatch
+--   - Spill metrics: "Disk Bytes Spilled" on shuffle stages — even with
+--     serverless auto-tuned shuffle partitions, correlated subqueries
+--     create unpredictable intermediate data sizes
+--   - Wall clock time: dominated by inner aggregation running per outer row
+--   - Photon nodes show fast per-batch processing but total time is high
+--     due to repeated invocations
 -- =============================================================================
 
 SELECT
